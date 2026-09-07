@@ -20,7 +20,10 @@ def test_default_sources_track_core(qtbot: QtBot, global_mmcore: CMMCorePlus):
     global_mmcore.setAutoFocusDevice("Autofocus")
     global_mmcore.enableContinuousFocus(False)
 
-    wdg = ContinuousFocusWidget(mmcore=global_mmcore, poll_interval_ms=0)
+    # toggle_settle_ms=0 makes the click path synchronous for this test
+    wdg = ContinuousFocusWidget(
+        mmcore=global_mmcore, poll_interval_ms=0, toggle_settle_ms=0
+    )
     qtbot.addWidget(wdg)
     wdg.refresh()
 
@@ -28,16 +31,18 @@ def test_default_sources_track_core(qtbot: QtBot, global_mmcore: CMMCorePlus):
     assert not wdg._button.isChecked()
     assert wdg._status_color == _COLOR_OFF
 
-    # clicking enables continuous focus on the core
+    # clicking enables continuous focus on the core; the demo device locks at once
     wdg._button.setChecked(True)
     wdg._on_button_clicked(True)
     assert global_mmcore.isContinuousFocusEnabled()
     assert wdg._button.isChecked()
+    assert wdg._status_color == _COLOR_LOCKED
 
     # clicking again disables it
     wdg._button.setChecked(False)
     wdg._on_button_clicked(False)
     assert not global_mmcore.isContinuousFocusEnabled()
+    assert not wdg._button.isChecked()
     assert wdg._status_color == _COLOR_OFF
 
 
@@ -106,3 +111,54 @@ def test_poll_interval_property(qtbot: QtBot, global_mmcore: CMMCorePlus):
     assert wdg.poll_interval_ms == 500
     wdg.poll_interval_ms = 250
     assert wdg.poll_interval_ms == 250
+
+
+def test_toggle_uses_hook_and_settles_before_rereading(
+    qtbot: QtBot, global_mmcore: CMMCorePlus
+):
+    """A click goes through ``set_enabled`` and waits ``toggle_settle_ms``.
+
+    While settling, polls must not read the status sources (on some hardware a
+    read right after a write is fatal). The deferred refresh then applies.
+    """
+    global_mmcore.setAutoFocusDevice("Autofocus")
+    state = {"enabled": False, "locked": False}
+    writes: list[bool] = []
+    reads = {"n": 0}
+
+    def set_enabled(on: bool) -> None:
+        writes.append(on)
+        state.update(enabled=on, locked=on)
+
+    def locked() -> bool:
+        reads["n"] += 1
+        return state["locked"]
+
+    wdg = ContinuousFocusWidget(
+        mmcore=global_mmcore,
+        enabled_source=lambda: state["enabled"],
+        locked_source=locked,
+        set_enabled=set_enabled,
+        poll_interval_ms=0,
+        toggle_settle_ms=200,
+    )
+    qtbot.addWidget(wdg)
+    wdg.refresh()
+    assert wdg._status_color == _COLOR_OFF
+    reads_before = reads["n"]
+
+    wdg._button.setChecked(True)
+    wdg._on_button_clicked(True)
+
+    # the write went through the hook immediately ...
+    assert writes == [True]
+    # ... but the widget is settling: a poll now must not touch the sources
+    assert wdg._toggling
+    wdg.refresh()
+    assert reads["n"] == reads_before
+    assert wdg._status_color == _COLOR_OFF
+
+    # after the settle delay the deferred refresh reads and updates
+    qtbot.waitUntil(lambda: not wdg._toggling, timeout=2000)
+    assert reads["n"] > reads_before
+    assert wdg._status_color == _COLOR_LOCKED

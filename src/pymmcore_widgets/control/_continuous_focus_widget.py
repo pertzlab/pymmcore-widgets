@@ -20,6 +20,7 @@ _COLOR_OFF = "#9E9E9E"  # grey: continuous focus off
 _COLOR_ERROR = "#E53935"  # red: status could not be read
 
 _DEFAULT_POLL_MS = 1000
+_DEFAULT_TOGGLE_SETTLE_MS = 1000
 
 
 class ContinuousFocusWidget(QWidget):
@@ -70,6 +71,15 @@ class ContinuousFocusWidget(QWidget):
         How often, in milliseconds, to poll the status sources while the widget
         is visible. Pass 0 to disable polling (the indicator then updates only on
         button clicks and config loads). By default, 1000.
+    set_enabled : Callable[[bool], None] | None
+        Optional callable that turns continuous focus on or off. Use it to route
+        the write through your own lock or bookkeeping. By default,
+        ``mmcore.enableContinuousFocus``.
+    toggle_settle_ms : int
+        How long to wait, in milliseconds, after a button click before reading
+        the status sources again. Polling pauses during this time. A PFS needs a
+        moment to lock, and some adapters must not be queried while a write is
+        still settling. By default, 1000.
     """
 
     def __init__(
@@ -81,6 +91,8 @@ class ContinuousFocusWidget(QWidget):
         locked_source: Callable[[], bool] | None = None,
         status_text_source: Callable[[], str] | None = None,
         poll_interval_ms: int = _DEFAULT_POLL_MS,
+        set_enabled: Callable[[bool], None] | None = None,
+        toggle_settle_ms: int = _DEFAULT_TOGGLE_SETTLE_MS,
     ) -> None:
         super().__init__(parent=parent)
 
@@ -88,6 +100,8 @@ class ContinuousFocusWidget(QWidget):
         self._enabled_source = enabled_source or self._mmc.isContinuousFocusEnabled
         self._locked_source = locked_source or self._mmc.isContinuousFocusLocked
         self._status_text_source = status_text_source
+        self._set_enabled = set_enabled or self._mmc.enableContinuousFocus
+        self._toggle_settle_ms = max(0, int(toggle_settle_ms))
 
         # guard against a poll fighting a user toggle mid-flight
         self._toggling = False
@@ -193,13 +207,22 @@ class ContinuousFocusWidget(QWidget):
 
     @Slot(bool)
     def _on_button_clicked(self, checked: bool) -> None:
+        # Write, then wait before reading the status again. A PFS needs a moment
+        # to lock, and some adapters (Nikon Ti) abort the process if the device
+        # is queried or reloaded while the write is still settling. refresh()
+        # does nothing while _toggling is set, so polls stay out of the way too.
         self._toggling = True
         try:
-            self._mmc.enableContinuousFocus(checked)
+            self._set_enabled(checked)
         except Exception:
             pass
-        finally:
-            self._toggling = False
+        if self._toggle_settle_ms > 0:
+            QTimer.singleShot(self._toggle_settle_ms, self._finish_toggle)
+        else:
+            self._finish_toggle()
+
+    def _finish_toggle(self) -> None:
+        self._toggling = False
         self.refresh()
 
     def _set_button_state(self, enabled: bool) -> None:
