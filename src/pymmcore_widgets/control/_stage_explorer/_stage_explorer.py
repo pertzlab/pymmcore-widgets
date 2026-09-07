@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -45,40 +46,97 @@ else:
 np.set_printoptions(suppress=True)
 
 STAGE_POLL_INTERVAL_MS = 100
-STAGE_POS_TOLERANCE_UM_SQ = 0.01  # 0.1 µm squared
+# movement threshold, squared µm. Keep it above the stage readout LSB: the
+# Nikon Ti reports in 0.1 µm steps and an idle readout can flip by one LSB,
+# which must not count as movement.
+STAGE_POS_TOLERANCE_UM_SQ = 0.0225  # 0.15 µm squared
+FOV_POLL_INTERVAL_MS = 500  # FOV re-check cadence (see _StagePoller)
+# after this many consecutive unchanged reads the poller backs off to the
+# idle interval; every serial position read holds the device module lock,
+# so an idle stage should not keep the bus saturated
+IDLE_AFTER_N_POLLS = 30
+STAGE_IDLE_INTERVAL_MS = 250
 
 
 class _StagePoller(QThread):
-    """Background thread that polls the XY stage position."""
+    """Background thread that polls the XY stage position.
+
+    With ``poll_fov=True`` it also re-checks the camera field of view every
+    ``FOV_POLL_INTERVAL_MS`` and emits ``fovChanged`` when it differs. This
+    catches FOV changes that emit no core event (``clearROI``, a python camera
+    resizing its own ROI) without any core access on the GUI thread: core
+    accessors can block on a device module lock held during a slow serial
+    read, so polling them from a GUI timer stalls the whole interface.
+    """
 
     positionChanged = Signal(float, float)
+    fovChanged = Signal(float, int, int)  # pixel size um, image width/height px
 
-    def __init__(self, mmc: CMMCorePlus, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        mmc: CMMCorePlus,
+        parent: QWidget | None = None,
+        interval_ms: int = STAGE_POLL_INTERVAL_MS,
+        poll_fov: bool = False,
+    ) -> None:
         super().__init__(parent)
         self._mmc = mmc
+        self._interval_ms = int(interval_ms)
+        self._poll_fov = poll_fov
 
     def run(self) -> None:
         """Poll the stage position.
 
-        If the stage position has changed by more than the tolerance since the last
-        poll, emit the positionChanged signal with the new stage position.
+        If the stage position has changed by more than the tolerance since the
+        last poll, emit the positionChanged signal with the new stage position.
+
+        Adaptive rate: after ``IDLE_AFTER_N_POLLS`` consecutive unchanged reads
+        the loop slows to ``STAGE_IDLE_INTERVAL_MS`` and snaps back to the fast
+        interval on the first movement. Every read costs a full serial
+        round-trip with the device module lock held; polling an idle stage at
+        the fast rate keeps that lock near-permanently busy and stalls every
+        other thread that touches a device behind it.
         """
         last: tuple[float, float] | None = None
+        last_fov: tuple[float, int, int] | None = None
+        next_fov_check = 0.0  # monotonic seconds; 0 -> check on the first pass
+        idle = 0
         while not self.isInterruptionRequested():
+            if self._poll_fov and time.monotonic() >= next_fov_check:
+                next_fov_check = time.monotonic() + FOV_POLL_INTERVAL_MS / 1000
+                fov = (
+                    self._mmc.getPixelSizeUm(),
+                    self._mmc.getImageWidth(),
+                    self._mmc.getImageHeight(),
+                )
+                if fov != last_fov:
+                    last_fov = fov
+                    self.fovChanged.emit(*fov)
+            moved = False
             if self._mmc.getXYStageDevice():
                 x, y = self._mmc.getXYPosition()
-                if last is not None:
-                    dx, dy = x - last[0], y - last[1]
-                    if dx * dx + dy * dy < STAGE_POS_TOLERANCE_UM_SQ:
-                        self.msleep(STAGE_POLL_INTERVAL_MS)
-                        continue
-                last = (x, y)
-                self.positionChanged.emit(x, y)
-            self.msleep(STAGE_POLL_INTERVAL_MS)
+                if last is None or (
+                    (x - last[0]) ** 2 + (y - last[1]) ** 2
+                    >= STAGE_POS_TOLERANCE_UM_SQ
+                ):
+                    last = (x, y)
+                    self.positionChanged.emit(x, y)
+                    moved = True
+            idle = 0 if moved else idle + 1
+            if idle >= IDLE_AFTER_N_POLLS:
+                self.msleep(STAGE_IDLE_INTERVAL_MS)
+            else:
+                self.msleep(self._interval_ms)
 
     def stop(self) -> None:
         self.requestInterruption()
-        self.wait()
+        # Bounded: the run loop may be blocked in a slow/stuck getXYPosition
+        # (e.g. a stage with a sticky Busy flag), so never wait forever on
+        # teardown. Force-terminate as a last resort: the loop only does
+        # read-only position reads, so this is safe on shutdown.
+        if not self.wait(3000):
+            self.terminate()
+            self.wait()
 
 
 # this might belong in _stage_position_marker.py
@@ -491,7 +549,8 @@ class StageExplorer(QWidget):
             parent=self._stage_viewer.view.scene,
             rect_width=w,
             rect_height=h,
-            marker_symbol_size=min(w, h) / 10,
+            # screen px: the crosshair keeps a constant size at any zoom
+            marker_symbol_size=16,
         )
         self._stage_pos_marker.visible = False
 
@@ -933,12 +992,16 @@ class AffineState:
     def _compute_system_affine(self) -> np.ndarray:
         flip_x = flip_y = False
         if cam := self.mmc.getCameraDevice():
-            flip_x = self.mmc.getProperty(cam, Keyword.Transpose_MirrorX) == "1"
-            flip_y = self.mmc.getProperty(cam, Keyword.Transpose_MirrorY) == "1"
+            # not every camera defines the Transpose_* properties
+            # (e.g. python devices loaded into a UniMMCore)
+            if self.mmc.hasProperty(cam, Keyword.Transpose_MirrorX):
+                flip_x = self.mmc.getProperty(cam, Keyword.Transpose_MirrorX) == "1"
+            if self.mmc.hasProperty(cam, Keyword.Transpose_MirrorY):
+                flip_y = self.mmc.getProperty(cam, Keyword.Transpose_MirrorY) == "1"
 
-        if self._pixel_config_is_identity():
-            return self._linear_matrix(flip_x, flip_y)
-        return self._pixel_config_matrix(flip_x, flip_y)
+        if self._pixel_config_is_usable():
+            return self._pixel_config_matrix(flip_x, flip_y)
+        return self._linear_matrix(flip_x=flip_x, flip_y=flip_y)
 
     def _linear_matrix(
         self, rotation: float = 0, flip_x: bool = False, flip_y: bool = False
@@ -953,8 +1016,13 @@ class AffineState:
         cos_ = np.cos(rotation_rad)
         sin_ = np.sin(rotation_rad)
         R[:2, :2] = np.array([[cos_, -sin_], [sin_, cos_]])
-        # scaling matrix
-        S = np.diag([self.pixel_size_um, self.pixel_size_um, 1, 1])
+        # scaling matrix. Fall back to 1 um/px when the pixel size is uncalibrated
+        # (0): a 0 scale makes the 2x2 linear block singular, which collapses the
+        # stage-position marker onto the origin. Only the FOV rectangle *size*
+        # should depend on the (missing) calibration: the marker *location* must
+        # still track the stage, so keep the transform non-singular.
+        scale = self.pixel_size_um or 1.0
+        S = np.diag([scale, scale, 1, 1])
         # flip the image if required
         if flip_x:
             S[0, 0] *= -1
@@ -962,17 +1030,25 @@ class AffineState:
             S[1, 1] *= -1
         return R @ S
 
-    def _pixel_config_is_identity(self) -> bool:
-        return np.allclose(self.pixel_size_affine, (1.0, 0.0, 0.0, 0.0, 1.0, 0.0))
+    def _pixel_config_is_usable(self) -> bool:
+        """Return True if the pixel size affine carries usable scale information.
+
+        The identity affine means "not configured", and a singular one (e.g. the
+        all-zeros affine reported when no pixel size config is defined) would
+        collapse everything onto a point, so both fall back to scaling by the
+        plain pixel size instead.
+        """
+        affine = np.asarray(self.pixel_size_affine, dtype=float)
+        if affine.shape != (6,):  # pragma: no cover
+            return False
+        if np.allclose(affine, (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)):
+            return False
+        return not np.isclose(np.linalg.det(affine.reshape(2, 3)[:, :2]), 0.0)
 
     def _pixel_config_matrix(
         self, flip_x: bool = False, flip_y: bool = False
     ) -> np.ndarray:
-        """Return the current pixel configuration affine, if set.
-
-        If the pixel configuration is not set (i.e. is the identity matrix),
-        it will return None.
-        """
+        """Return the current pixel configuration affine as a 4x4 matrix."""
         tform = np.eye(4)
         tform[:2, :3] = np.array(self.pixel_size_affine).reshape(2, 3)
         # flip the image if required
