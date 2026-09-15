@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 import useq
 from pymmcore_plus import CMMCorePlus
-from qtpy.QtCore import QEvent, QItemSelectionModel, QSize, Qt, Signal
+from qtpy.QtCore import QEvent, QItemSelectionModel, QSize, Qt, QTimer, Signal
 from qtpy.QtGui import QFontInfo, QPalette
 from qtpy.QtWidgets import (
     QApplication,
@@ -57,7 +57,7 @@ from ._overlays import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from PyQt6.QtGui import QAction
     from qtpy.QtGui import QCloseEvent, QColor, QIcon, QShowEvent
@@ -188,6 +188,13 @@ class StageMapWidget(QWidget):
         # the widget is hidden, see hideEvent/showEvent)
         self._polling: bool = False
         self._poll_interval_ms: int = 33
+        # core reads deferred out of core event handlers (see _defer). The
+        # timer is a child of this widget, so a pending read dies with the
+        # map instead of firing into a destroyed one.
+        self._deferred: list[Callable[[], None]] = []
+        self._defer_timer = QTimer(self)
+        self._defer_timer.setSingleShot(True)
+        self._defer_timer.timeout.connect(self._run_deferred)
         # True while the widget is hidden across a reparent (dock float/redock),
         # which recreates the underlying QOpenGLWidget's GL context and
         # invalidates every visual. While set, GL draws are skipped (drawing into
@@ -368,9 +375,7 @@ class StageMapWidget(QWidget):
         if table is not None:
             table.valueChanged.connect(self._refresh_positions)
             table.destroyed.connect(self._on_table_destroyed)
-            table.table().itemSelectionChanged.connect(
-                self._sync_selection_from_table
-            )
+            table.table().itemSelectionChanged.connect(self._sync_selection_from_table)
 
         self._update_source_label()
         self._update_action_enablement()
@@ -1110,9 +1115,7 @@ class StageMapWidget(QWidget):
         if idx is None:
             tbl.clearSelection()
             return
-        ctrl = any(
-            getattr(k, "name", "") == "Control" for k in (event.modifiers or ())
-        )
+        ctrl = any(getattr(k, "name", "") == "Control" for k in (event.modifiers or ()))
         flags = QItemSelectionModel.SelectionFlag.Rows | (
             QItemSelectionModel.SelectionFlag.Toggle
             if ctrl
@@ -1211,7 +1214,10 @@ class StageMapWidget(QWidget):
         r = self._stage_viewer.view.camera.rect
         cur = (r.left, r.bottom, r.width, r.height)
         scale = max(abs(v) for v in self._fit_rect) or 1.0
-        if all(abs(c - f) <= scale * 1e-6 for c, f in zip(cur, self._fit_rect)):
+        if all(
+            abs(c - f) <= scale * 1e-6
+            for c, f in zip(cur, self._fit_rect, strict=False)
+        ):
             self.zoom_to_fit()
 
     def _build_stage_marker(self) -> None:
@@ -1267,26 +1273,66 @@ class StageMapWidget(QWidget):
         # the zoom cache alone would not notice the change
         self._update_label_offsets()
 
+    def _defer(self, fn: Callable[[], None]) -> None:
+        """Run ``fn`` from the event loop, once the emitting core call returned.
+
+        Core events are emitted synchronously from inside the core call that
+        caused them, on that call's thread. Reading the core back from the
+        handler therefore re-enters it mid-operation: during
+        ``unloadAllDevices`` that read lands on half-destroyed devices and is
+        a native access violation (seen on every kernel shutdown with the map
+        docked). Deferred, the read happens after the call completed, on the
+        GUI thread, and on an unloaded core simply finds no camera.
+        """
+        if self._closing:
+            return
+        if fn not in self._deferred:
+            self._deferred.append(fn)
+        self._defer_timer.start(0)
+
+    def _run_deferred(self) -> None:
+        pending, self._deferred = self._deferred, []
+        if self._closing:
+            return
+        for fn in pending:
+            fn()
+
     def _on_pixel_size_changed(self, value: float = 0.0) -> None:
         self._affine_state.refresh()
-        self._update_fov_size()
+        self._defer(self._update_fov_size)
 
     def _on_roi_changed(self) -> None:
-        self._update_fov_size()
+        self._defer(self._update_fov_size)
 
     def _on_property_changed(self, device: str, prop: str, value: str = "") -> None:
         """Catch field-of-view changes that emit no dedicated event.
 
         Binning changes only emit propertyChanged, and swapping the Core
-        camera / XY stage device likewise.
+        camera / XY stage device likewise. A cleared Core device (empty
+        value), which is what ``unloadAllDevices`` emits on its way down,
+        only drops the cached state and stops the poller: nothing is read
+        from the core, see :meth:`_defer`.
         """
+        if self._closing:
+            return
         if device == "Core":
             if prop == "Camera":
-                self._update_fov_size()
+                if not value:
+                    self._last_fov_size = None
+                    with suppress(Exception):
+                        self._stage_poller.stop()
+                    return
+                self._defer(self._update_fov_size)
             elif prop == "XYStage":
-                self._update_stage_controller()
+                if not value:
+                    self._xy_device = ""
+                    self._stage_controller = None
+                    with suppress(Exception):
+                        self._stage_poller.stop()
+                    return
+                self._defer(self._update_stage_controller)
         elif prop == "Binning":
-            self._update_fov_size()
+            self._defer(self._update_fov_size)
 
     def _on_fov_polled(self, px_size: float, width: int, height: int) -> None:
         """Apply a field-of-view change spotted by the background poller.
