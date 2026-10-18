@@ -84,6 +84,16 @@ class PlateCalibrationStore:
         file = self.path_for(plate_name)
         return self._read(file) if file.is_file() else None
 
+    def modified_time(self, plate_name: str) -> float | None:
+        """Return when the calibration for `plate_name` was saved, or None.
+
+        The time is a POSIX timestamp, comparable with `time.time()`.
+        """
+        try:
+            return self.path_for(plate_name).stat().st_mtime
+        except OSError:
+            return None
+
     def delete(self, plate_name: str) -> bool:
         """Delete the stored calibration for `plate_name`.
 

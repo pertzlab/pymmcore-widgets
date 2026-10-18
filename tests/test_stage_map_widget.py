@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 import useq
-from qtpy.QtWidgets import QMessageBox
+from qtpy.QtWidgets import QFileDialog, QMessageBox
 
 from pymmcore_widgets.control._stage_map._calibration_store import (
     PlateCalibrationStore,
@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
     from pymmcore_plus import CMMCorePlus
     from pytestqt.qtbot import QtBot
+
+    from pymmcore_widgets import MDAWidget
 
 A1_XY = (1000.0, 2000.0)
 PLAN = useq.WellPlatePlan(plate="96-well", a1_center_xy=A1_XY, rotation=2.0)
@@ -513,6 +515,304 @@ def test_stage_map_assign_wells_skips_hcs_table(
     wdg.assign_wells_to_positions()
     assert infos
     assert not table.table().rowData(0).get("well")
+
+
+def _calib(plan: useq.WellPlatePlan | None) -> tuple | None:
+    """The part of a plan that the map and the HCS wizard share."""
+    if plan is None:
+        return None
+    return plan.plate.name, plan.a1_center_xy, plan.rotation
+
+
+def _map_with_mda(
+    qtbot: QtBot, mmcore: CMMCorePlus, tmp_path: Path
+) -> tuple[StageMapWidget, MDAWidget]:
+    """A map bound to the position table of an MDA widget."""
+    from pymmcore_widgets import MDAWidget
+
+    mda = MDAWidget(mmcore=mmcore)
+    qtbot.addWidget(mda)
+    # the table starts with the current stage position; empty it, so finishing
+    # the HCS wizard does not open the (modal) "Overwrite Positions" dialog
+    mda.stage_positions.setValue([])
+    wdg = StageMapWidget(mmcore=mmcore, calibration_dir=tmp_path / "store")
+    qtbot.addWidget(wdg)
+    wdg.setPositionTable(mda.stage_positions)
+    return wdg, mda
+
+
+def test_stage_map_import_calibrates_hcs_wizard(
+    qtbot: QtBot,
+    global_mmcore: CMMCorePlus,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A calibration imported in the map is applied to the MDA's HCS wizard."""
+    wdg, mda = _map_with_mda(qtbot, global_mmcore, tmp_path)
+    wizard = mda.stage_positions.hcsWizard()
+    assert wizard.calibration() is None
+    wizard.plate_page.widget.setValue(
+        useq.WellPlatePlan(
+            plate="96-well", a1_center_xy=(0, 0), selected_wells=(0, slice(0, 3))
+        )
+    )
+    selection = wizard.plate_page.widget.currentSelection()
+    assert len(selection) == 3
+
+    file = tmp_path / "calibration.json"
+    file.write_text(PLAN.model_dump_json())
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a: (str(file), ""))
+    wdg._import_calibration()
+
+    assert _calib(wizard.calibration()) == _calib(PLAN)
+    # the experiment's well selection is kept for the same plate format
+    assert wizard.plate_page.widget.currentSelection() == selection
+
+
+def test_hcs_wizard_calibration_shows_on_stage_map(
+    qtbot: QtBot,
+    global_mmcore: CMMCorePlus,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A calibration loaded or confirmed in the HCS wizard shows on the map."""
+    wdg, mda = _map_with_mda(qtbot, global_mmcore, tmp_path)
+    wizard = mda.stage_positions.hcsWizard()
+    store = PlateCalibrationStore(tmp_path / "store")
+    ask = Mock(return_value=True)
+    monkeypatch.setattr(wdg, "_ask_use_loaded_calibration", ask)
+
+    # loaded from a file in the wizard: shown, and stored like an import
+    loaded = useq.WellPlatePlan(
+        plate="384-well",
+        a1_center_xy=(500.0, -500.0),
+        rotation=-1.0,
+        selected_wells=slice(0, 2),
+    )
+    file = tmp_path / "plan.json"
+    file.write_text(loaded.model_dump_json())
+    wizard.load(str(file))
+    assert _calib(wdg.platePlan()) == _calib(loaded)
+    assert wdg.toolBar().plate_combo.currentText() == "384-well"  # type: ignore[attr-defined]
+    assert _calib(store.load("384-well")) == _calib(loaded)
+
+    # calibrated in the wizard: shown once the wizard is finished
+    fitted = useq.WellPlatePlan(plate="384-well", a1_center_xy=A1_XY, rotation=0.5)
+    wizard.calibration_page.widget.setValue(fitted)
+    assert _calib(wdg.platePlan()) == _calib(loaded)
+    wizard.accept()
+    assert _calib(wdg.platePlan()) == _calib(fitted)
+
+    # loaded with an MDA sequence whose positions are a plate plan; it differs
+    # from the stored calibration, so the map asks first
+    ask.assert_not_called()
+    in_sequence = loaded.model_copy(update={"a1_center_xy": (10.0, 20.0)})
+    mda.setValue(useq.MDASequence(stage_positions=in_sequence))
+    ask.assert_called_once()
+    assert _calib(wdg.platePlan()) == _calib(in_sequence)
+
+
+def test_stage_map_binding_syncs_hcs_wizard(
+    qtbot: QtBot, global_mmcore: CMMCorePlus, tmp_path: Path
+) -> None:
+    """On binding, the newer calibration wins; an uncalibrated wizard gets one."""
+    from pymmcore_widgets import MDAWidget
+
+    mda = MDAWidget(mmcore=global_mmcore)
+    qtbot.addWidget(mda)
+    table = mda.stage_positions
+    wdg = StageMapWidget(mmcore=global_mmcore, calibration_dir=tmp_path)
+    qtbot.addWidget(wdg)
+
+    wdg.setPlatePlan(PLAN)
+    wdg.setPositionTable(table)
+    assert _calib(table.hcsWizard().calibration()) == _calib(PLAN)
+
+    # unbound, the two are independent
+    wdg.setPositionTable(None)
+    other = useq.WellPlatePlan(plate="96-well", a1_center_xy=(0.0, 0.0), rotation=0.0)
+    table.hcsWizard().setCalibration(other)
+    assert _calib(wdg.platePlan()) == _calib(PLAN)
+
+    wdg.setPositionTable(table)
+    assert _calib(wdg.platePlan()) == _calib(other)
+
+
+def _import(
+    wdg: StageMapWidget,
+    plan: useq.WellPlatePlan,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Import `plan` in the map, as from the toolbar (which also stores it)."""
+    file = tmp_path / "import.json"
+    file.write_text(plan.model_dump_json())
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a: (str(file), ""))
+    wdg._import_calibration()
+
+
+def test_stage_map_rebinding_keeps_the_newer_calibration(
+    qtbot: QtBot,
+    global_mmcore: CMMCorePlus,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On binding again, an older wizard calibration does not replace a newer one."""
+    wdg, mda = _map_with_mda(qtbot, global_mmcore, tmp_path)
+    table = mda.stage_positions
+    wizard = table.hcsWizard()
+    store = PlateCalibrationStore(tmp_path / "store")
+    wdg.setPlatePlan(PLAN)
+    assert _calib(wizard.calibration()) == _calib(PLAN)
+
+    # unbound, the map stores a newer calibration and then shows no plate
+    wdg.setPositionTable(None)
+    newer = useq.WellPlatePlan(plate="96-well", a1_center_xy=(5e3, 6e3), rotation=1.0)
+    _import(wdg, newer, tmp_path, monkeypatch)
+    wizard._applied_at = (wizard.calibrationTime() or 0.0) - 10  # older, for sure
+    wdg.setPlatePlan(None)
+
+    wdg.setPositionTable(table)
+    assert _calib(wdg.platePlan()) == _calib(newer)
+    assert _calib(store.load("96-well")) == _calib(newer)
+    assert _calib(wizard.calibration()) == _calib(newer)
+
+
+def test_stage_map_ignores_a_cancelled_wizard_fit(
+    qtbot: QtBot, global_mmcore: CMMCorePlus, tmp_path: Path
+) -> None:
+    """A fit that the user cancels in the wizard reaches neither map nor store."""
+    wdg, mda = _map_with_mda(qtbot, global_mmcore, tmp_path)
+    table = mda.stage_positions
+    wizard = table.hcsWizard()
+    wdg.setPlatePlan(PLAN)
+
+    fit = useq.WellPlatePlan(plate="96-well", a1_center_xy=(-1.0, -2.0), rotation=3.0)
+    wizard.calibration_page.widget.setValue(fit)
+    wizard.reject()
+    wdg.setPositionTable(None)
+    wdg.setPositionTable(table)
+
+    assert _calib(wdg.platePlan()) == _calib(PLAN)
+    assert PlateCalibrationStore(tmp_path / "store").load("96-well") is None
+    assert _calib(wizard.calibration()) == _calib(PLAN)
+
+
+def test_stage_map_deleted_calibration_stays_deleted(
+    qtbot: QtBot,
+    global_mmcore: CMMCorePlus,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a delete in the map, the wizard does not send the calibration back."""
+    wdg, mda = _map_with_mda(qtbot, global_mmcore, tmp_path)
+    wizard = mda.stage_positions.hcsWizard()
+    store = PlateCalibrationStore(tmp_path / "store")
+    _import(wdg, PLAN, tmp_path, monkeypatch)
+    assert _calib(wizard.calibration()) == _calib(PLAN)
+
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+    )
+    wdg._delete_calibration()
+    assert wizard.calibration() is None
+    wizard.accept()  # nothing is calibrated, so nothing is sent
+    assert store.load("96-well") is None
+    assert wdg.platePlan() is None
+
+
+def test_stage_map_asks_before_a_loaded_plan_replaces_the_stored_calibration(
+    qtbot: QtBot,
+    global_mmcore: CMMCorePlus,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loaded plan with another calibration asks before it replaces the stored."""
+    wdg, mda = _map_with_mda(qtbot, global_mmcore, tmp_path)
+    wizard = mda.stage_positions.hcsWizard()
+    store = PlateCalibrationStore(tmp_path / "store")
+    _import(wdg, PLAN, tmp_path, monkeypatch)
+    loaded = useq.WellPlatePlan(
+        plate="96-well",
+        a1_center_xy=(10.0, 20.0),
+        rotation=0.0,
+        selected_wells=slice(0, 1),
+    )
+    plan_file = tmp_path / "loaded.json"
+    plan_file.write_text(loaded.model_dump_json())
+    ask = Mock(return_value=False)
+    monkeypatch.setattr(wdg, "_ask_use_loaded_calibration", ask)
+
+    # "Keep Stored": the wizard gets the stored calibration back
+    wizard.load(str(plan_file))
+    ask.assert_called_once()
+    assert _calib(wdg.platePlan()) == _calib(PLAN)
+    assert _calib(store.load("96-well")) == _calib(PLAN)
+    assert _calib(wizard.calibration()) == _calib(PLAN)
+
+    # "Use Loaded": the loaded calibration replaces the stored one
+    ask.return_value = True
+    wizard.load(str(plan_file))
+    assert _calib(wdg.platePlan()) == _calib(loaded)
+    assert _calib(store.load("96-well")) == _calib(loaded)
+
+    # a calibration that the user makes in the wizard does not ask
+    ask.reset_mock()
+    fitted = useq.WellPlatePlan(plate="96-well", a1_center_xy=A1_XY, rotation=0.5)
+    wizard.calibration_page.widget.setValue(fitted)
+    wizard.accept()
+    ask.assert_not_called()
+    assert _calib(store.load("96-well")) == _calib(fitted)
+
+
+def test_stage_map_does_not_push_while_calibrating_in_the_wizard(
+    qtbot: QtBot, global_mmcore: CMMCorePlus, tmp_path: Path
+) -> None:
+    """A map calibration does not discard work on the open calibration page."""
+    wdg, mda = _map_with_mda(qtbot, global_mmcore, tmp_path)
+    wizard = mda.stage_positions.hcsWizard()
+    wizard.show()
+    wizard.next()
+    assert wizard.currentPage() is wizard.calibration_page
+    wdg.setPlatePlan(PLAN)
+    assert wizard.calibration() is None
+
+    # on another page of the wizard, the map's calibration is applied
+    wizard.back()
+    moved = useq.WellPlatePlan(plate="96-well", a1_center_xy=(1.0, 2.0), rotation=0.0)
+    wdg.setPlatePlan(moved)
+    assert _calib(wizard.calibration()) == _calib(moved)
+
+
+def test_stage_map_warns_if_the_store_cannot_be_written(
+    qtbot: QtBot,
+    global_mmcore: CMMCorePlus,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A calibration store that cannot be written warns; the map still shows it."""
+    wdg, mda = _map_with_mda(qtbot, global_mmcore, tmp_path)
+    wizard = mda.stage_positions.hcsWizard()
+
+    def _fail(plan: useq.WellPlatePlan) -> Path:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(wdg._store, "save", _fail)
+    with pytest.warns(UserWarning, match="Could not store"):
+        wizard.setValue(PLAN)
+    assert _calib(wdg.platePlan()) == _calib(PLAN)
+
+
+def test_hcs_wizard_uses_the_core_of_its_table(qtbot: QtBot) -> None:
+    """The HCS wizard of a position table drives the core of that table."""
+    from pymmcore_plus import CMMCorePlus
+
+    from pymmcore_widgets.mda._core_positions import CoreConnectedPositionTable
+
+    core = CMMCorePlus()
+    table = CoreConnectedPositionTable(mmcore=core)
+    qtbot.addWidget(table)
+    assert table.hcsWizard()._mmc is core
 
 
 def test_stage_map_labels_fall_back_to_well(
