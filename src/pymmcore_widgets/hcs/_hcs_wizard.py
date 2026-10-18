@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import time
 import warnings
 from contextlib import suppress
 from pathlib import Path
 
 import useq
 from pymmcore_plus import CMMCorePlus
-from qtpy.QtCore import QSize, Slot
+from qtpy.QtCore import QSize, Signal, Slot
 from qtpy.QtWidgets import QFileDialog, QVBoxLayout, QWidget, QWizard, QWizardPage
 from useq import WellPlatePlan
 
@@ -30,12 +31,23 @@ class HCSWizard(QWizard):
         The CMMCorePlus instance. By default, None.
     """
 
+    # Emitted with (plan, source) whenever a plate calibration is applied to the
+    # wizard. `plan` is a useq.WellPlatePlan that holds only the plate, the A1
+    # center and the rotation. `source` tells where the calibration came from:
+    # "loaded" (`setValue` or `load`, e.g. a file or an MDA sequence), "set"
+    # (`setCalibration`) or "finished" (the user finished the wizard). Fits made
+    # while wells are still being calibrated are not emitted.
+    calibrationApplied = Signal(object, str)
+
     def __init__(
         self, parent: QWidget | None = None, *, mmcore: CMMCorePlus | None = None
     ) -> None:
         super().__init__(parent)
         self._mmc = mmcore or CMMCorePlus.instance()
         self._calibrated: bool = False
+        # the last applied calibration and when it was applied (time.time())
+        self._applied: useq.WellPlatePlan | None = None
+        self._applied_at: float | None = None
 
         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
         self.setWindowTitle("HCS Wizard")
@@ -71,6 +83,8 @@ class HCSWizard(QWizard):
         self.calibration_page.widget.calibrationChanged.connect(
             self._on_calibration_changed
         )
+        self.accepted.connect(self._on_accepted)
+        self.rejected.connect(self._on_rejected)
 
     def sizeHint(self) -> QSize:
         return QSize(880, 690)
@@ -105,6 +119,53 @@ class HCSWizard(QWizard):
                 self.points_plan_page._get_fov_size()
             )
         self.points_plan_page.widget.setValue(point_plan)
+        self._apply_calibration("loaded")
+
+    def calibration(self) -> useq.WellPlatePlan | None:
+        """Return the last applied plate calibration, or None.
+
+        A calibration is applied when it is loaded (`setValue`, `load`), set with
+        `setCalibration`, or confirmed by finishing the wizard. A fit that the
+        user is still making on the calibration page is not returned. The
+        returned plan holds only the plate, the A1 center and the rotation.
+        """
+        return self._applied
+
+    def calibrationTime(self) -> float | None:
+        """Return when the calibration was applied (as `time.time()`), or None."""
+        return self._applied_at
+
+    def setCalibration(self, plan: useq.WellPlatePlan) -> None:
+        """Apply the plate calibration of `plan` (plate, A1 center and rotation).
+
+        Unlike `setValue`, this keeps the well selection and the points plan.
+        Only a different plate format resets the well selection.
+        """
+        if self.plate_page.widget.value().plate != plan.plate:
+            self.plate_page.widget.setValue(plan.plate)
+            self._on_plate_changed(self.plate_page.widget.value())
+        # a calibration without rotation is square with the stage axes; with
+        # rotation None, the calibration page would ask for a calibration
+        self.calibration_page.widget.setValue(
+            useq.WellPlatePlan(
+                plate=plan.plate,
+                a1_center_xy=plan.a1_center_xy,
+                rotation=plan.rotation or 0.0,
+            )
+        )
+        self._apply_calibration("set")
+
+    def clearCalibration(self, plate: useq.WellPlate) -> None:
+        """Forget the calibration of `plate`, e.g. after it was deleted elsewhere.
+
+        If the calibration page shows that calibration, it goes back to an
+        uncalibrated `plate`. Nothing is emitted.
+        """
+        if self._applied is None or self._applied.plate != plate:
+            return
+        if self.calibration_page.widget.value() == self._applied:
+            self.calibration_page.widget.setValue(plate)
+        self._applied = self._applied_at = None
 
     @Slot()
     def save(self, path: str | None = None) -> None:
@@ -165,6 +226,32 @@ class HCSWizard(QWizard):
     def _on_calibration_changed(self, calibrated: bool) -> None:
         self._calibrated = calibrated
         self.button(QWizard.WizardButton.CustomButton1).setEnabled(calibrated)
+
+    def _apply_calibration(self, source: str) -> None:
+        """Record the calibration of the calibration page as applied, and emit it."""
+        plan = self.calibration_page.widget.value()
+        if not self._calibrated or plan is None:
+            return
+        self._applied = plan
+        self._applied_at = time.time()
+        self.calibrationApplied.emit(plan, source)
+
+    @Slot()
+    def _on_accepted(self) -> None:
+        self._apply_calibration("finished")
+
+    @Slot()
+    def _on_rejected(self) -> None:
+        """Undo a fit that the user made on the calibration page but did not confirm."""
+        applied = self._applied
+        current = self.calibration_page.widget.value()
+        if (
+            applied is not None
+            and current is not None
+            and current.plate == applied.plate
+            and current != applied
+        ):
+            self.calibration_page.widget.setValue(applied)
 
 
 # ---------------------------------- PAGES ---------------------------------------
