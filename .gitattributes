@@ -1,0 +1,11 @@
+# Merge the two export lists with "union" so the pertzlab rebuild stops
+# conflicting on them. Every widget branch adds an import and an __all__
+# entry to these files. Union is a built-in git merge mode: it keeps the
+# lines from both sides instead of writing conflict markers. That is safe
+# here because these files are little more than lists of exports.
+#
+# git reads this file from the branch you merge into, so it has to be
+# committed on pertzlab before the merges run. The rebuild recipe in
+# PERTZLAB.md does that.
+src/pymmcore_widgets/__init__.py            merge=union
+src/pymmcore_widgets/control/__init__.py    merge=union
