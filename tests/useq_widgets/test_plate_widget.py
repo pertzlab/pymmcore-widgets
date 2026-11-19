@@ -131,3 +131,41 @@ def test_pen_width_scales_with_plate() -> None:
         rows=2, columns=3, well_spacing=(0.11, 0.11), well_size=(0.085, 0.085)
     )
     assert 1 <= _scaled_pen_width(mini) < 85 / 2
+
+
+DISH = useq.WellPlate(
+    rows=1,
+    columns=1,
+    well_spacing=0.0,
+    well_size=14.0,
+    circular_wells=True,
+    name="test-dish",
+)
+
+
+def test_plate_widget_selects_single_well(qtbot: QtBot) -> None:
+    """Choosing a plate with one well (e.g. a dish) selects that well."""
+    useq.register_well_plates({"test-dish": DISH})
+    wdg = WellPlateWidget()
+    qtbot.addWidget(wdg)
+    wdg.plate_name.setCurrentText("test-dish")
+    assert wdg.currentSelection() == ((0, 0),)
+    assert list(wdg.value().selected_well_names) == ["A1"]
+
+    # a multi-well plate starts without a selection, as before
+    wdg.plate_name.setCurrentText("96-well")
+    assert wdg.currentSelection() == ()
+
+
+def test_edge_spots_single_well() -> None:
+    """The test spots of a plate with one well are small and inside the well."""
+    from pymmcore_widgets.useq_widgets._well_plate_widget import WellPlateView
+
+    view = WellPlateView()
+    view.setDrawWellEdgeSpots(True)
+    view.drawPlate(useq.WellPlatePlan(plate=DISH, a1_center_xy=(0, 0)))
+    spots = view._well_edge_spots
+    assert len(spots) == 5
+    for spot in spots:
+        rect = spot.rect()
+        assert 0 < rect.width() < DISH.well_size[0] * 1000 / 4

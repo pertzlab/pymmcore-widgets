@@ -65,6 +65,10 @@ class PlateCalibrationWidget(QWidget):
     wells, which additionally fits the rotation.  Two wells is quicker and is
     enough for a plate held in a fixed, well machined holder; use three
     whenever the plate can sit at a slight angle.
+
+    A plate with a single well (e.g. a glass bottom dish) is calibrated with
+    that one well, whatever the mode: its center is the plate origin and the
+    rotation is assumed to be zero.
     """
 
     calibrationChanged = Signal(bool)
@@ -86,6 +90,7 @@ class PlateCalibrationWidget(QWidget):
 
         # WIDGETS ------------------------------------------------------------
 
+        self._mode_label = QLabel("Calibrate with:")
         self._mode_combo = QComboBox()
         self._mode_combo.addItems([str(m) for m in CalibrationMode])
         self._mode_combo.setCurrentText(str(self._mode))
@@ -131,7 +136,7 @@ class PlateCalibrationWidget(QWidget):
 
         mode_row = QHBoxLayout()
         mode_row.setContentsMargins(0, 0, 0, 0)
-        mode_row.addWidget(QLabel("Calibrate with:"), 0)
+        mode_row.addWidget(self._mode_label, 0)
         mode_row.addWidget(self._mode_combo, 1)
 
         right_wdg = QGroupBox()
@@ -199,6 +204,10 @@ class PlateCalibrationWidget(QWidget):
 
         self._current_plate = plate
         self._plate_view.drawPlate(plate)
+        # with a single well there is nothing to choose: one well is calibrated
+        single_well = self._is_single_well()
+        self._mode_label.setVisible(not single_well)
+        self._mode_combo.setVisible(not single_well)
 
         # clear existing calibration widgets, and the well centers they recorded:
         # a later fit must not reuse wells of an earlier plate or calibration
@@ -298,6 +307,19 @@ class PlateCalibrationWidget(QWidget):
             if (round(curr_x), round(curr_y)) != (round(rnd_x), round(rnd_y)):
                 return rnd_x, rnd_y
 
+    def _is_single_well(self) -> bool:
+        """Return True if the current plate has only one well (e.g. a dish)."""
+        plate = self._current_plate
+        return plate is not None and plate.rows * plate.columns == 1
+
+    def _wells_required(self) -> int:
+        """Number of calibrated wells needed for the current plate and mode."""
+        return 1 if self._is_single_well() else self._mode.wells_required
+
+    def _solves_rotation(self) -> bool:
+        """Whether the rotation is fitted for the current plate and mode."""
+        return self._mode.solves_rotation and not self._is_single_well()
+
     def _on_mode_changed(self, text: str) -> None:
         """Redo the fit with the newly selected number of calibration wells."""
         self._mode = CalibrationMode(text)
@@ -335,12 +357,12 @@ class PlateCalibrationWidget(QWidget):
                 a1_center_xy : tuple[float, float]
             The rotation angle in degrees (anti-clockwise) of the plate.
         """
-        if len(self._calibrated_wells) < self._mode.wells_required:
+        if len(self._calibrated_wells) < self._wells_required():
             # not enough wells calibrated
             return None
 
         try:
-            if self._mode.solves_rotation:
+            if self._solves_rotation():
                 params = well_coords_affine(self._calibrated_wells)
             else:
                 nominal = None
@@ -451,12 +473,17 @@ class PlateCalibrationWidget(QWidget):
             x0, y0 = self._a1_center_xy
             txt += f"\nA1 Center [mm]: ({x0 / 1000:.2f}, {y0 / 1000:.2f}),   "
             txt += f"Well Spacing [mm]: ({spacing[0]:.2f}, {spacing[1]:.2f}),   "
-            if self._mode.solves_rotation:
+            if self._solves_rotation():
                 txt += f"Rotation: {self._rotation}°"
             else:
-                txt += "Rotation: assumed 0° (2 well calibration)"
-        elif len(self._calibrated_wells) < self._mode.wells_required:
-            txt = f"Please calibrate at least {self._mode.wells_required} wells."
+                n = self._wells_required()
+                txt += f"Rotation: assumed 0° ({n} well calibration)"
+        elif len(self._calibrated_wells) < (n := self._wells_required()):
+            txt = (
+                "Please calibrate the well."
+                if n == 1
+                else f"Please calibrate at least {n} wells."
+            )
             ico = style.standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
         else:
             txt = (
