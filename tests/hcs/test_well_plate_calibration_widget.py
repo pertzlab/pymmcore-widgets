@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 import useq
 from pymmcore_plus import CMMCorePlus
 
@@ -207,3 +208,145 @@ def test_plate_calibration_test_positions(global_mmcore: CMMCorePlus, qtbot) -> 
         data.append((hover_item_data.x, hover_item_data.y, hover_item_data.name))
 
     assert data == expected_data
+
+
+def test_plate_calibration_two_point_mode(global_mmcore: CMMCorePlus, qtbot) -> None:
+    """Two wells are enough when the rotation is assumed to be zero."""
+    from unittest.mock import Mock
+
+    from tests._utils import wait_signal
+
+    from pymmcore_widgets.hcs._plate_calibration_widget import CalibrationMode
+
+    wdg = PlateCalibrationWidget(mmcore=global_mmcore)
+    wdg.show()
+    qtbot.addWidget(wdg)
+    wdg.setValue("96-well")
+    assert wdg.calibrationMode() is CalibrationMode.THREE_POINT
+
+    wdg.setCalibrationMode(CalibrationMode.TWO_POINT)
+    assert wdg.calibrationMode() is CalibrationMode.TWO_POINT
+
+    # calibrate A1 and H12, i.e. opposite corners of the plate
+    spacing = 9000.0
+    a1 = (1000.0, 2000.0)
+    for (row, col), center in {
+        (0, 0): a1,
+        (7, 11): (a1[0] + 11 * spacing, a1[1] - 7 * spacing),
+    }.items():
+        wdg._plate_view.setSelectedIndices({(row, col)})
+        with wait_signal(qtbot, wdg.calibrationChanged):
+            wdg._current_calibration_widget().setWellCenter(center)
+
+    value = wdg.value()
+    assert value is not None
+    assert value.a1_center_xy == pytest.approx(a1, abs=0.01)
+    assert value.rotation == pytest.approx(0.0)
+    assert wdg._well_spacing == pytest.approx((9.0, 9.0), abs=0.001)
+
+    # switching back to three points makes it incomplete again
+    mock = Mock()
+    wdg.calibrationChanged.connect(mock)
+    wdg.setCalibrationMode(CalibrationMode.THREE_POINT)
+    mock.assert_called_once_with(False)
+    assert "at least 3 wells" in wdg._info.text()
+
+
+def test_plate_calibration_two_point_same_row(
+    global_mmcore: CMMCorePlus, qtbot
+) -> None:
+    """Two wells in the same row fall back to the nominal row spacing."""
+    from tests._utils import wait_signal
+
+    from pymmcore_widgets.hcs._plate_calibration_widget import CalibrationMode
+
+    wdg = PlateCalibrationWidget(mmcore=global_mmcore)
+    wdg.show()
+    qtbot.addWidget(wdg)
+    wdg.setValue("96-well")
+    wdg.setCalibrationMode(CalibrationMode.TWO_POINT)
+
+    spacing = 9000.0
+    a1 = (1000.0, 2000.0)
+    for (row, col), center in {
+        (0, 0): a1,
+        (0, 11): (a1[0] + 11 * spacing, a1[1]),
+    }.items():
+        wdg._plate_view.setSelectedIndices({(row, col)})
+        with wait_signal(qtbot, wdg.calibrationChanged):
+            wdg._current_calibration_widget().setWellCenter(center)
+
+    value = wdg.value()
+    assert value is not None
+    assert value.a1_center_xy == pytest.approx(a1, abs=0.01)
+    # the column spacing was measured, the row spacing came from the plate
+    assert wdg._well_spacing == pytest.approx((9.0, 9.0), abs=0.001)
+
+
+def test_plate_calibration_set_value_forgets_wells(
+    global_mmcore: CMMCorePlus, qtbot
+) -> None:
+    """setValue forgets calibrated wells, so a later fit cannot use them again."""
+    from tests._utils import wait_signal
+
+    from pymmcore_widgets.hcs._plate_calibration_widget import CalibrationMode
+
+    wdg = PlateCalibrationWidget(mmcore=global_mmcore)
+    wdg.show()
+    qtbot.addWidget(wdg)
+    wdg.setValue("96-well")
+    for (row, col), center in {
+        (0, 0): (0.0, 0.0),
+        (0, 2): (18000.0, 0.0),
+        (2, 0): (0.0, -18000.0),
+    }.items():
+        wdg._plate_view.setSelectedIndices({(row, col)})
+        with wait_signal(qtbot, wdg.calibrationChanged):
+            wdg._current_calibration_widget().setWellCenter(center)
+
+    plan = useq.WellPlatePlan(plate="96-well", a1_center_xy=(777, 888), rotation=0.0)
+    wdg.setValue(plan)
+    # a new calibration mode keeps the plan instead of a fit of the old wells
+    wdg.setCalibrationMode(CalibrationMode.TWO_POINT)
+    assert wdg.value() == plan
+
+
+@pytest.mark.parametrize("mode", ["2 wells (no rotation)", "3 wells (with rotation)"])
+def test_plate_calibration_single_well(
+    global_mmcore: CMMCorePlus, qtbot, mode: str
+) -> None:
+    """A plate with one well (e.g. a glass bottom dish) needs one well, any mode."""
+    from tests._utils import wait_signal
+
+    dish = useq.WellPlate(
+        rows=1,
+        columns=1,
+        well_spacing=0.0,
+        well_size=14.0,
+        circular_wells=True,
+        name="dish",
+    )
+    wdg = PlateCalibrationWidget(mmcore=global_mmcore)
+    wdg.show()
+    qtbot.addWidget(wdg)
+    wdg.setCalibrationMode(mode)
+    wdg.setValue(dish)
+    assert not wdg._mode_combo.isVisible()
+    assert "calibrate the well" in wdg._info.text()
+
+    center = (1000.0, 2000.0)
+    wdg._plate_view.setSelectedIndices({(0, 0)})
+    with wait_signal(qtbot, wdg.calibrationChanged):
+        wdg._current_calibration_widget().setWellCenter(center)
+
+    value = wdg.value()
+    assert value is not None
+    assert value.a1_center_xy == pytest.approx(center, abs=0.01)
+    assert value.rotation == pytest.approx(0.0)
+    assert "Plate calibrated" in wdg._info.text()
+    assert wdg._tab_wdg.isTabEnabled(1)
+    assert value.image_positions[0].x == pytest.approx(center[0])
+
+    # a multi-well plate brings the mode choice back
+    wdg.setValue("96-well")
+    assert wdg._mode_combo.isVisible()
