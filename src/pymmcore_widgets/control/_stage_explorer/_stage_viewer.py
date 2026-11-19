@@ -8,7 +8,7 @@ import numpy as np
 import vispy
 import vispy.scene
 import vispy.visuals
-from qtpy.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from qtpy.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from qtpy.QtGui import QPalette
 from qtpy.QtWidgets import QLabel, QVBoxLayout, QWidget
 from vispy import scene
@@ -77,9 +77,25 @@ class StageViewer(QWidget):
 
     # --------------------GL CONTEXT RESET (reparent)--------------------
 
+    def sizeHint(self) -> QSize:
+        """Preferred size: vispy's default canvas size.
+
+        The vispy Qt backend reports its *current* size as its hint, so once a
+        layout has squeezed the canvas the hint follows it down and the viewer
+        never asks for its space back. A fixed hint keeps it stable.
+        """
+        return QSize(800, 600)
+
     def _create_canvas(self) -> None:
         """Create the vispy canvas, view, camera and grid (fresh GL context)."""
-        self.canvas = vispy.scene.SceneCanvas(show=True)
+        # Created hidden and parented to this widget. vispy's default
+        # (``show=True``, no parent) first shows the canvas as a top-level
+        # window with its own native window and GL context, which are then
+        # torn down again when the canvas is reparented into the layout below.
+        # On Windows that reparent crashes Qt (native access violation) when
+        # it happens while the host window still has a dock relayout pending,
+        # e.g. adding this viewer to napari right after another dock widget.
+        self.canvas = vispy.scene.SceneCanvas(parent=self, show=False)
         self.view = cast("ViewBox", self.canvas.central_widget.add_view())
         self.view.camera = scene.PanZoomCamera(aspect=1)
         self._create_grid()
