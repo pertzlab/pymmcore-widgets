@@ -200,11 +200,13 @@ class PlateCalibrationWidget(QWidget):
         self._current_plate = plate
         self._plate_view.drawPlate(plate)
 
-        # clear existing calibration widgets
+        # clear existing calibration widgets, and the well centers they recorded:
+        # a later fit must not reuse wells of an earlier plate or calibration
         while self._calibration_widgets:
             wdg = self._calibration_widgets.popitem()[1]
             self._calibration_widget_stack.removeWidget(wdg)
             wdg.deleteLater()
+        self._calibrated_wells.clear()
 
         self._plate_view.setSelectedIndices([(0, 0)])  # select A1
 
@@ -299,6 +301,10 @@ class PlateCalibrationWidget(QWidget):
     def _on_mode_changed(self, text: str) -> None:
         """Redo the fit with the newly selected number of calibration wells."""
         self._mode = CalibrationMode(text)
+        if not self._calibrated_wells:
+            # no wells calibrated here (e.g. a plan set with setValue): keep it
+            self._update_info()
+            return
         # keep whatever is already calibrated, just re-solve with the new model
         self._recompute_calibration()
 

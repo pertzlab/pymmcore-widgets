@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
     from vispy.app.canvas import MouseEvent
 
     from pymmcore_widgets.control._stage_explorer._stage_viewer import VisualNode
+    from pymmcore_widgets.hcs import HCSWizard
 else:
     from qtpy.QtWidgets import QAction
 
@@ -116,6 +118,19 @@ def _split_camel(name: str) -> str:
     return re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", name)
 
 
+def _same_calibration(
+    a: useq.WellPlatePlan | None, b: useq.WellPlatePlan | None
+) -> bool:
+    """Return True if `a` and `b` put the same plate at the same stage position."""
+    if a is None or b is None:
+        return a is b
+    return bool(
+        a.plate == b.plate
+        and np.allclose(a.a1_center_xy, b.a1_center_xy, rtol=0, atol=1e-3)
+        and np.isclose(a.rotation or 0.0, b.rotation or 0.0, rtol=0, atol=1e-6)
+    )
+
+
 class StageMapWidget(QWidget):
     """A live map of the XY stage with well plate overlay and stored positions.
 
@@ -138,6 +153,14 @@ class StageMapWidget(QWidget):
     the next time the same plate format is selected, so a plate only needs to be
     calibrated once per stage/holder, not once per experiment.  Calibrations can
     be redone, imported/exported, or deleted at any time from the toolbar.
+
+    When the bound table belongs to an [MDAWidget][pymmcore_widgets.MDAWidget],
+    the map shares its plate calibration with the table's HCS wizard (the "Well
+    Plate..." button).  A calibration loaded, calibrated or set on either side
+    is applied to the other one too.  One that comes from the wizard is also
+    stored, the same as an imported one.  Before a loaded plan replaces a
+    different stored calibration, the map asks.  On binding, the newer of the
+    two calibrations wins.
 
     With a calibrated plate, the "Assign Positions to Wells" action fills in the
     well of each position in the bound table (the closest well centroid), which
@@ -213,6 +236,10 @@ class StageMapWidget(QWidget):
         # own, see setPositionTable
         self._pos_table: PositionTable | None = None
         self._auto_bind_attempted: bool = False
+        # the bound table's HCS wizard, which shares the plate calibration with
+        # the map (see _bind_hcs_wizard); True while one side applies the other
+        self._hcs_wizard: HCSWizard | None = None
+        self._syncing_wizard: bool = False
         self._calib_dialog: _PlateCalibrationDialog | None = None
         # last field of view size used to draw the position rectangles
         self._last_fov_size: tuple[float, float] | None = None
@@ -368,13 +395,12 @@ class StageMapWidget(QWidget):
         if table is not None:
             table.valueChanged.connect(self._refresh_positions)
             table.destroyed.connect(self._on_table_destroyed)
-            table.table().itemSelectionChanged.connect(
-                self._sync_selection_from_table
-            )
+            table.table().itemSelectionChanged.connect(self._sync_selection_from_table)
 
         self._update_source_label()
         self._update_action_enablement()
         self._refresh_positions()
+        self._bind_hcs_wizard()
         self.positionTableChanged.emit(table)
 
     def linkablePositionTables(self) -> dict[str, PositionTable]:
@@ -742,6 +768,7 @@ class StageMapWidget(QWidget):
         self._update_status()
         self._update_action_enablement()
         self.platePlanChanged.emit(self.platePlan())
+        self._push_calibration_to_wizard()
         if plan is not None:
             self.zoom_to_fit()
 
@@ -773,7 +800,7 @@ class StageMapWidget(QWidget):
         if self._calib_dialog is not None and (
             (plan := self._calib_dialog.value()) is not None
         ):
-            self._store.save(plan)
+            self._store_calibration(plan)
             self._set_plan(plan, calibrated=True)
 
     def _on_calibration_dialog_finished(self) -> None:
@@ -796,6 +823,9 @@ class StageMapWidget(QWidget):
         ):
             return
         self._store.delete(plate.name)
+        # the wizard must not send the deleted calibration back later
+        if self._hcs_wizard is not None:
+            self._hcs_wizard.clearCalibration(plate)
         plan = useq.WellPlatePlan(plate=plate, a1_center_xy=(0.0, 0.0))
         self._set_plan(plan, calibrated=False)
 
@@ -822,8 +852,123 @@ class StageMapWidget(QWidget):
         except ValueError as e:
             QMessageBox.warning(self, "Import Error", f"Invalid calibration file:\n{e}")
             return
-        self._store.save(plan)
+        self._store_calibration(plan)
         self.setPlatePlan(plan)
+
+    def _store_calibration(self, plan: useq.WellPlatePlan) -> None:
+        """Persist `plan`.  If the store cannot be written, warn and continue."""
+        try:
+            self._store.save(plan)
+        except OSError as e:
+            warnings.warn(f"Could not store the plate calibration: {e}", stacklevel=2)
+
+    def _bind_hcs_wizard(self) -> None:
+        """Share the plate calibration with the bound table's HCS wizard.
+
+        Only the position table of an MDA widget has one.  On binding, the newer
+        calibration wins: the wizard's last applied calibration, or the stored
+        calibration of the same plate.  An uncalibrated wizard takes the map's
+        calibration.
+        """
+        if (old := self._hcs_wizard) is not None:
+            with suppress(RuntimeError, TypeError):
+                old.calibrationApplied.disconnect(self._on_wizard_calibration)
+        self._hcs_wizard = None
+
+        get_wizard = getattr(self._pos_table, "hcsWizard", None)
+        if not callable(get_wizard):
+            return
+        self._hcs_wizard = wizard = get_wizard()
+        wizard.calibrationApplied.connect(self._on_wizard_calibration)
+
+        if (wizard_plan := wizard.calibration()) is None:
+            self._push_calibration_to_wizard()
+            return
+        if _same_calibration(wizard_plan, self.platePlan()):
+            return
+        name = wizard_plan.plate.name
+        stored = self._store.load(name)
+        if stored is not None and (self._store.modified_time(name) or 0.0) > (
+            wizard.calibrationTime() or 0.0
+        ):
+            self.setPlatePlan(stored)  # this also pushes it to the wizard
+        else:
+            self._adopt_wizard_calibration(wizard_plan)
+
+    def _on_wizard_calibration(self, plan: useq.WellPlatePlan, source: str) -> None:
+        """Show and store a calibration applied in the HCS wizard."""
+        if self._closing or self._syncing_wizard:
+            return
+        if _same_calibration(plan, self.platePlan()):
+            return
+        # a loaded plan (a file, an MDA sequence) can be old or from another
+        # scope: ask before it replaces a different stored calibration
+        stored = self._store.load(plan.plate.name)
+        if (
+            source == "loaded"
+            and stored is not None
+            and not _same_calibration(plan, stored)
+            and not self._ask_use_loaded_calibration(plan, stored)
+        ):
+            self._syncing_wizard = True
+            try:
+                self.setPlatePlan(stored)
+                if self._hcs_wizard is not None:
+                    self._hcs_wizard.setCalibration(stored)
+            finally:
+                self._syncing_wizard = False
+            return
+        self._adopt_wizard_calibration(plan)
+
+    def _adopt_wizard_calibration(self, plan: useq.WellPlatePlan) -> None:
+        """Store and show a calibration from the HCS wizard."""
+        self._store_calibration(plan)
+        self._syncing_wizard = True
+        try:
+            self.setPlatePlan(plan)
+        finally:
+            self._syncing_wizard = False
+
+    def _ask_use_loaded_calibration(
+        self, loaded: useq.WellPlatePlan, stored: useq.WellPlatePlan
+    ) -> bool:
+        """Ask if a loaded calibration replaces the stored one.  True means yes."""
+
+        def _describe(plan: useq.WellPlatePlan) -> str:
+            x, y = plan.a1_center_xy
+            rot = plan.rotation or 0.0
+            return f"A1 at ({x / 1000:.2f}, {y / 1000:.2f}) mm, rotation {rot:.2f}°"
+
+        answer = QMessageBox.question(
+            self,
+            "Different Plate Calibration",
+            f"The loaded plan has a different calibration for {stored.plate.name!r}"
+            f" than the stored one.\n\nStored: {_describe(stored)}\n"
+            f"Loaded: {_describe(loaded)}\n\nReplace the stored calibration with "
+            "the loaded one?\n\nIf you keep the stored one, positions that came "
+            'with the loaded plan still use the loaded calibration. Press "Update '
+            'Positions List" in the HCS wizard to make them again.',
+            defaultButton=QMessageBox.StandardButton.No,
+        )
+        return bool(answer == QMessageBox.StandardButton.Yes)
+
+    def _push_calibration_to_wizard(self) -> None:
+        """Apply the map's calibration to the bound table's HCS wizard."""
+        wizard = self._hcs_wizard
+        plan = self.platePlan()
+        if wizard is None or plan is None or self._syncing_wizard:
+            return
+        if _same_calibration(plan, wizard.calibration()):
+            return
+        if wizard.isVisible() and wizard.currentPage() is wizard.calibration_page:
+            # the user is calibrating in the wizard: do not discard that work.
+            # Finishing the wizard sends its calibration to the map.
+            return
+        self._syncing_wizard = True
+        try:
+            wizard.setCalibration(plan)
+        finally:
+            self._syncing_wizard = False
 
     def _update_status(self) -> None:
         if self._plan is None:
@@ -1060,9 +1205,11 @@ class StageMapWidget(QWidget):
         """Unbind when the table we were showing goes away.
 
         The C++ object is already gone here, so its signals must not be touched
-        (which rules out going through setPositionTable).
+        (which rules out going through setPositionTable).  The same goes for
+        its HCS wizard, a child of the table.
         """
         self._pos_table = None
+        self._hcs_wizard = None
         self._update_source_label()
         self._update_action_enablement()
         self._refresh_positions()
@@ -1110,9 +1257,7 @@ class StageMapWidget(QWidget):
         if idx is None:
             tbl.clearSelection()
             return
-        ctrl = any(
-            getattr(k, "name", "") == "Control" for k in (event.modifiers or ())
-        )
+        ctrl = any(getattr(k, "name", "") == "Control" for k in (event.modifiers or ()))
         flags = QItemSelectionModel.SelectionFlag.Rows | (
             QItemSelectionModel.SelectionFlag.Toggle
             if ctrl
@@ -1211,7 +1356,10 @@ class StageMapWidget(QWidget):
         r = self._stage_viewer.view.camera.rect
         cur = (r.left, r.bottom, r.width, r.height)
         scale = max(abs(v) for v in self._fit_rect) or 1.0
-        if all(abs(c - f) <= scale * 1e-6 for c, f in zip(cur, self._fit_rect)):
+        if all(
+            abs(c - f) <= scale * 1e-6
+            for c, f in zip(cur, self._fit_rect, strict=False)
+        ):
             self.zoom_to_fit()
 
     def _build_stage_marker(self) -> None:
@@ -1323,6 +1471,10 @@ class StageMapWidget(QWidget):
         ):
             with suppress(Exception):
                 sig.disconnect(slot)
+        # the wizard belongs to the MDA widget and usually outlives the map
+        if (wizard := self._hcs_wizard) is not None:
+            with suppress(Exception):
+                wizard.calibrationApplied.disconnect(self._on_wizard_calibration)
 
 
 class _PlateCalibrationDialog(QDialog):

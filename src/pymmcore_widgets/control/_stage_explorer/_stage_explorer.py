@@ -116,8 +116,7 @@ class _StagePoller(QThread):
             if self._mmc.getXYStageDevice():
                 x, y = self._mmc.getXYPosition()
                 if last is None or (
-                    (x - last[0]) ** 2 + (y - last[1]) ** 2
-                    >= STAGE_POS_TOLERANCE_UM_SQ
+                    (x - last[0]) ** 2 + (y - last[1]) ** 2 >= STAGE_POS_TOLERANCE_UM_SQ
                 ):
                     last = (x, y)
                     self.positionChanged.emit(x, y)

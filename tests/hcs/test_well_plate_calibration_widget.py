@@ -281,3 +281,31 @@ def test_plate_calibration_two_point_same_row(
     assert value.a1_center_xy == pytest.approx(a1, abs=0.01)
     # the column spacing was measured, the row spacing came from the plate
     assert wdg._well_spacing == pytest.approx((9.0, 9.0), abs=0.001)
+
+
+def test_plate_calibration_set_value_forgets_wells(
+    global_mmcore: CMMCorePlus, qtbot
+) -> None:
+    """setValue forgets calibrated wells, so a later fit cannot use them again."""
+    from tests._utils import wait_signal
+
+    from pymmcore_widgets.hcs._plate_calibration_widget import CalibrationMode
+
+    wdg = PlateCalibrationWidget(mmcore=global_mmcore)
+    wdg.show()
+    qtbot.addWidget(wdg)
+    wdg.setValue("96-well")
+    for (row, col), center in {
+        (0, 0): (0.0, 0.0),
+        (0, 2): (18000.0, 0.0),
+        (2, 0): (0.0, -18000.0),
+    }.items():
+        wdg._plate_view.setSelectedIndices({(row, col)})
+        with wait_signal(qtbot, wdg.calibrationChanged):
+            wdg._current_calibration_widget().setWellCenter(center)
+
+    plan = useq.WellPlatePlan(plate="96-well", a1_center_xy=(777, 888), rotation=0.0)
+    wdg.setValue(plan)
+    # a new calibration mode keeps the plan instead of a fit of the old wells
+    wdg.setCalibrationMode(CalibrationMode.TWO_POINT)
+    assert wdg.value() == plan
