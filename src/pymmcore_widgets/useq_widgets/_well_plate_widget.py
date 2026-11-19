@@ -227,7 +227,11 @@ class WellPlateWidget(QWidget):
     def _on_plate_name_changed(self, plate_name: str) -> None:
         self._view.clearSelection()
         plate = useq.WellPlate.from_str(plate_name)
-        val = self.value().model_copy(update={"plate": plate, "selected_wells": None})
+        # a plate with one well (e.g. a dish): select it, there is no other choice
+        selected = ((0,), (0,)) if plate.rows * plate.columns == 1 else None
+        val = self.value().model_copy(
+            update={"plate": plate, "selected_wells": selected}
+        )
         self.setValue(val)
         self.valueChanged.emit(self.value())
 
@@ -506,6 +510,10 @@ class WellPlateView(ResizingGraphicsView):
         half_sy = plate.well_spacing[1] * 1000 / 2
         width, height = half_sx - well_width / 2, half_sy - well_height / 2
         width = min(width, height)
+        if width <= 0:
+            # no gap between wells (e.g. a plate with one well and a spacing of 0):
+            # size the spots from the well instead
+            width = min(well_width, well_height) / 10
 
         # central point
         cx, cy = rect.center().x(), rect.center().y()
