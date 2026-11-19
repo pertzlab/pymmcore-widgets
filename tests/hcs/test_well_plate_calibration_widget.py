@@ -309,3 +309,44 @@ def test_plate_calibration_set_value_forgets_wells(
     # a new calibration mode keeps the plan instead of a fit of the old wells
     wdg.setCalibrationMode(CalibrationMode.TWO_POINT)
     assert wdg.value() == plan
+
+
+@pytest.mark.parametrize("mode", ["2 wells (no rotation)", "3 wells (with rotation)"])
+def test_plate_calibration_single_well(
+    global_mmcore: CMMCorePlus, qtbot, mode: str
+) -> None:
+    """A plate with one well (e.g. a glass bottom dish) needs one well, any mode."""
+    from tests._utils import wait_signal
+
+    dish = useq.WellPlate(
+        rows=1,
+        columns=1,
+        well_spacing=0.0,
+        well_size=14.0,
+        circular_wells=True,
+        name="dish",
+    )
+    wdg = PlateCalibrationWidget(mmcore=global_mmcore)
+    wdg.show()
+    qtbot.addWidget(wdg)
+    wdg.setCalibrationMode(mode)
+    wdg.setValue(dish)
+    assert not wdg._mode_combo.isVisible()
+    assert "calibrate the well" in wdg._info.text()
+
+    center = (1000.0, 2000.0)
+    wdg._plate_view.setSelectedIndices({(0, 0)})
+    with wait_signal(qtbot, wdg.calibrationChanged):
+        wdg._current_calibration_widget().setWellCenter(center)
+
+    value = wdg.value()
+    assert value is not None
+    assert value.a1_center_xy == pytest.approx(center, abs=0.01)
+    assert value.rotation == pytest.approx(0.0)
+    assert "Plate calibrated" in wdg._info.text()
+    assert wdg._tab_wdg.isTabEnabled(1)
+    assert value.image_positions[0].x == pytest.approx(center[0])
+
+    # a multi-well plate brings the mode choice back
+    wdg.setValue("96-well")
+    assert wdg._mode_combo.isVisible()
