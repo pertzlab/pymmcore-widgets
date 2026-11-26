@@ -47,6 +47,23 @@ DATA_INDEX = 2
 DATA_SELECTED = 3
 DATA_COLOR = 4
 
+# divisor chosen so that the standard plates (which all have roughly the same
+# extent) keep the 200 µm pen width that has always been used for them
+_PEN_WIDTH_DIVISOR = 527
+
+
+def _scaled_pen_width(plate: useq.WellPlate) -> int:
+    """Return a pen width in µm suited to the size of `plate`.
+
+    Scaled to the extent of the plate rather than fixed, so that plates much
+    smaller than a standard SBS one (e.g. a custom slide of a few hundred µm)
+    are not drawn with a pen wider than their own wells.
+    """
+    extent_x = (plate.columns - 1) * plate.well_spacing[0] * 1000 + (
+        plate.well_size[0] * 1000
+    )
+    return max(1, int(extent_x / _PEN_WIDTH_DIVISOR))
+
 
 class WellPlateWidget(QWidget):
     """Widget for selecting a well plate and a subset of wells.
@@ -210,7 +227,11 @@ class WellPlateWidget(QWidget):
     def _on_plate_name_changed(self, plate_name: str) -> None:
         self._view.clearSelection()
         plate = useq.WellPlate.from_str(plate_name)
-        val = self.value().model_copy(update={"plate": plate, "selected_wells": None})
+        # a plate with one well (e.g. a dish): select it, there is no other choice
+        selected = ((0,), (0,)) if plate.rows * plate.columns == 1 else None
+        val = self.value().model_copy(
+            update={"plate": plate, "selected_wells": selected}
+        )
         self.setValue(val)
         self.valueChanged.emit(self.value())
 
@@ -432,11 +453,10 @@ class WellPlateView(ResizingGraphicsView):
 
         # font for well labels
         font = QFont()
-        font.setPixelSize(int(min(6000, well_rect.width() / 2.5)))
+        font.setPixelSize(max(1, int(min(6000, well_rect.width() / 2.5))))
 
-        # Since most plates have the same extent, a constant pen width seems to work
         pen = QPen(Qt.GlobalColor.black)
-        pen.setWidth(200)
+        pen.setWidth(_scaled_pen_width(plan.plate))
 
         self.clear()
         indices = plan.all_well_indices.reshape(-1, 2)
@@ -490,6 +510,10 @@ class WellPlateView(ResizingGraphicsView):
         half_sy = plate.well_spacing[1] * 1000 / 2
         width, height = half_sx - well_width / 2, half_sy - well_height / 2
         width = min(width, height)
+        if width <= 0:
+            # no gap between wells (e.g. a plate with one well and a spacing of 0):
+            # size the spots from the well instead
+            width = min(well_width, well_height) / 10
 
         # central point
         cx, cy = rect.center().x(), rect.center().y()
